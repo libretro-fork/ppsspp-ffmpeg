@@ -20,10 +20,10 @@
 
 #include "frame_thread_encoder.h"
 
-#include "libavutil/fifo.h"
+#include <retro_spsc.h>
 #include "libavutil/avassert.h"
 #include "libavutil/imgutils.h"
-#include "libavutil/thread.h"
+#include "libavutil/retro_thread.h"
 #include "avcodec.h"
 #include "internal.h"
 #include "thread.h"
@@ -38,75 +38,55 @@ typedef struct{
     unsigned index;
 } Task;
 
-typedef struct{
+typedef struct EncoderWorker {
+    AVCodecContext *avctx;
+    sthread_t *thread;
+    retro_spsc_t jobs;
+} EncoderWorker;
+typedef struct {
     AVCodecContext *parent_avctx;
-    pthread_mutex_t buffer_mutex;
-
-    AVFifoBuffer *task_fifo;
-    pthread_mutex_t task_fifo_mutex;
-    pthread_cond_t task_fifo_cond;
-
     Task finished_tasks[BUFFER_SIZE];
-    pthread_mutex_t finished_task_mutex;
-    pthread_cond_t finished_task_cond;
-
+    retro_atomic_int_t ready[BUFFER_SIZE];
     unsigned task_index;
     unsigned finished_task_index;
-
-    pthread_t worker[MAX_THREADS];
-    int exit;
+    unsigned submitted;
+    unsigned returned;
+    EncoderWorker workers[MAX_THREADS];
+    int workers_created;
+    retro_atomic_int_t exit;
 } ThreadContext;
 
-static void * attribute_align_arg worker(void *v){
-    AVCodecContext *avctx = v;
+static void attribute_align_arg worker(void *v)
+{
+    EncoderWorker *w = v;
+    AVCodecContext *avctx = w->avctx;
     ThreadContext *c = avctx->internal->frame_thread_encoder;
-    AVPacket *pkt = NULL;
-
-    while(!c->exit){
-        int got_packet, ret;
-        AVFrame *frame;
+    for (;;) {
         Task task;
-
-        if(!pkt) pkt= av_mallocz(sizeof(*pkt));
-        if(!pkt) continue;
-        av_init_packet(pkt);
-
-        pthread_mutex_lock(&c->task_fifo_mutex);
-        while (av_fifo_size(c->task_fifo) <= 0 || c->exit) {
-            if(c->exit){
-                pthread_mutex_unlock(&c->task_fifo_mutex);
-                goto end;
-            }
-            pthread_cond_wait(&c->task_fifo_cond, &c->task_fifo_mutex);
-        }
-        av_fifo_generic_read(c->task_fifo, &task, sizeof(task), NULL);
-        pthread_mutex_unlock(&c->task_fifo_mutex);
+        AVFrame *frame;
+        AVPacket *pkt;
+        int got_packet = 0, ret;
+        FF_RETRO_WAIT(&w->jobs, retro_spsc_read_avail(&w->jobs) >= sizeof(task) ||
+                                  retro_atomic_load_acquire_int(&c->exit));
+        if (retro_atomic_load_acquire_int(&c->exit)) break;
+        av_assert0(retro_spsc_read(&w->jobs, &task, sizeof(task)) == sizeof(task));
+        FF_RETRO_NOTIFY(&w->jobs);
         frame = task.indata;
-
-        ret = avcodec_encode_video2(avctx, pkt, frame, &got_packet);
-        pthread_mutex_lock(&c->buffer_mutex);
-        av_frame_unref(frame);
-        pthread_mutex_unlock(&c->buffer_mutex);
+        pkt = av_mallocz(sizeof(*pkt));
+        if (pkt) {
+            av_init_packet(pkt);
+            ret = avcodec_encode_video2(avctx, pkt, frame, &got_packet);
+            if (got_packet) {
+                int ref_result = av_packet_make_refcounted(pkt);
+                if (ref_result < 0) { av_packet_unref(pkt); ret = ref_result; }
+            } else av_packet_unref(pkt);
+        } else ret = AVERROR(ENOMEM);
         av_frame_free(&frame);
-        if(got_packet) {
-            av_packet_make_refcounted(pkt);
-        } else {
-            pkt->data = NULL;
-            pkt->size = 0;
-        }
-        pthread_mutex_lock(&c->finished_task_mutex);
-        c->finished_tasks[task.index].outdata = pkt; pkt = NULL;
+        c->finished_tasks[task.index].outdata = pkt;
         c->finished_tasks[task.index].return_code = ret;
-        pthread_cond_signal(&c->finished_task_cond);
-        pthread_mutex_unlock(&c->finished_task_mutex);
+        retro_atomic_store_release_int(&c->ready[task.index], 1);
+        FF_RETRO_NOTIFY(&c->ready[task.index]);
     }
-end:
-    av_free(pkt);
-    pthread_mutex_lock(&c->buffer_mutex);
-    avcodec_close(avctx);
-    pthread_mutex_unlock(&c->buffer_mutex);
-    av_freep(&avctx);
-    return NULL;
 }
 
 int ff_frame_thread_encoder_init(AVCodecContext *avctx, AVDictionary *options){
@@ -175,15 +155,10 @@ int ff_frame_thread_encoder_init(AVCodecContext *avctx, AVDictionary *options){
 
     c->parent_avctx = avctx;
 
-    c->task_fifo = av_fifo_alloc_array(BUFFER_SIZE, sizeof(Task));
-    if(!c->task_fifo)
-        goto fail;
+    retro_atomic_int_init(&c->exit, 0);
+    for (i = 0; i < BUFFER_SIZE; ++i) retro_atomic_int_init(&c->ready[i], 0);
+    i = 0;
 
-    pthread_mutex_init(&c->task_fifo_mutex, NULL);
-    pthread_mutex_init(&c->finished_task_mutex, NULL);
-    pthread_mutex_init(&c->buffer_mutex, NULL);
-    pthread_cond_init(&c->task_fifo_cond, NULL);
-    pthread_cond_init(&c->finished_task_cond, NULL);
 
     for(i=0; i<avctx->thread_count ; i++){
         AVDictionary *tmp = NULL;
@@ -203,14 +178,24 @@ int ff_frame_thread_encoder_init(AVCodecContext *avctx, AVDictionary *options){
         av_dict_set(&tmp, "threads", "1", 0);
         if(avcodec_open2(thread_avctx, avctx->codec, &tmp) < 0) {
             av_dict_free(&tmp);
+            avcodec_free_context(&thread_avctx);
             goto fail;
         }
         av_dict_free(&tmp);
         av_assert0(!thread_avctx->internal->frame_thread_encoder);
         thread_avctx->internal->frame_thread_encoder = c;
-        if(pthread_create(&c->worker[i], NULL, worker, thread_avctx)) {
+        c->workers[i].avctx = thread_avctx;
+        if (!retro_spsc_init(&c->workers[i].jobs, 4 * sizeof(Task))) {
+            avcodec_free_context(&c->workers[i].avctx);
             goto fail;
         }
+        c->workers[i].thread = sthread_create(worker, &c->workers[i]);
+        if (!c->workers[i].thread) {
+            retro_spsc_free(&c->workers[i].jobs);
+            avcodec_free_context(&c->workers[i].avctx);
+            goto fail;
+        }
+        ++c->workers_created;
     }
 
     avctx->active_thread_type = FF_THREAD_FRAME;
@@ -223,72 +208,71 @@ fail:
     return -1;
 }
 
-void ff_frame_thread_encoder_free(AVCodecContext *avctx){
+void ff_frame_thread_encoder_free(AVCodecContext *avctx)
+{
+    ThreadContext *c = avctx->internal->frame_thread_encoder;
     int i;
-    ThreadContext *c= avctx->internal->frame_thread_encoder;
-
-    pthread_mutex_lock(&c->task_fifo_mutex);
-    c->exit = 1;
-    pthread_cond_broadcast(&c->task_fifo_cond);
-    pthread_mutex_unlock(&c->task_fifo_mutex);
-
-    for (i=0; i<avctx->thread_count; i++) {
-         pthread_join(c->worker[i], NULL);
+    if (!c) return;
+    retro_atomic_store_release_int(&c->exit, 1);
+    for (i = 0; i < c->workers_created; ++i) FF_RETRO_NOTIFY(&c->workers[i].jobs);
+    for (i = 0; i < c->workers_created; ++i) {
+        EncoderWorker *w = &c->workers[i];
+        Task task;
+        sthread_join(w->thread);
+        while (retro_spsc_read(&w->jobs, &task, sizeof(task)) == sizeof(task)) {
+            AVFrame *frame = task.indata;
+            av_frame_free(&frame);
+        }
+        retro_spsc_free(&w->jobs);
+        w->avctx->internal->frame_thread_encoder = NULL;
+        avcodec_free_context(&w->avctx);
     }
-
-    pthread_mutex_destroy(&c->task_fifo_mutex);
-    pthread_mutex_destroy(&c->finished_task_mutex);
-    pthread_mutex_destroy(&c->buffer_mutex);
-    pthread_cond_destroy(&c->task_fifo_cond);
-    pthread_cond_destroy(&c->finished_task_cond);
-    av_fifo_freep(&c->task_fifo);
+    for (i = 0; i < BUFFER_SIZE; ++i) {
+        AVPacket *pkt = c->finished_tasks[i].outdata;
+        if (pkt) { av_packet_unref(pkt); av_free(pkt); }
+    }
     av_freep(&avctx->internal->frame_thread_encoder);
 }
 
-int ff_thread_video_encode_frame(AVCodecContext *avctx, AVPacket *pkt, const AVFrame *frame, int *got_packet_ptr){
+int ff_thread_video_encode_frame(AVCodecContext *avctx, AVPacket *pkt,
+                                 const AVFrame *frame, int *got_packet_ptr)
+{
     ThreadContext *c = avctx->internal->frame_thread_encoder;
     Task task;
-    int ret;
-
+    int result;
+    unsigned index;
     av_assert1(!*got_packet_ptr);
-
-    if(frame){
-        AVFrame *new = av_frame_alloc();
-        if(!new)
-            return AVERROR(ENOMEM);
-        ret = av_frame_ref(new, frame);
-        if(ret < 0) {
-            av_frame_free(&new);
-            return ret;
-        }
-
+    if (frame) {
+        EncoderWorker *w = &c->workers[c->submitted % c->workers_created];
+        AVFrame *copy = av_frame_alloc();
+        if (!copy) return AVERROR(ENOMEM);
+        result = av_frame_ref(copy, frame);
+        if (result < 0) { av_frame_free(&copy); return result; }
         task.index = c->task_index;
-        task.indata = (void*)new;
-        pthread_mutex_lock(&c->task_fifo_mutex);
-        av_fifo_generic_write(c->task_fifo, &task, sizeof(task), NULL);
-        pthread_cond_signal(&c->task_fifo_cond);
-        pthread_mutex_unlock(&c->task_fifo_mutex);
-
-        c->task_index = (c->task_index+1) % BUFFER_SIZE;
-
-        if(!c->finished_tasks[c->finished_task_index].outdata && (c->task_index - c->finished_task_index) % BUFFER_SIZE <= avctx->thread_count)
+        task.indata = copy;
+        FF_RETRO_WAIT(&w->jobs, retro_spsc_write_avail(&w->jobs) >= sizeof(task));
+        av_assert0(retro_spsc_write(&w->jobs, &task, sizeof(task)) == sizeof(task));
+        FF_RETRO_NOTIFY(&w->jobs);
+        ++c->submitted;
+        c->task_index = (c->task_index + 1) % BUFFER_SIZE;
+        if (!retro_atomic_load_acquire_int(&c->ready[c->finished_task_index]) &&
+            c->submitted - c->returned <= avctx->thread_count)
             return 0;
     }
-
-    if(c->task_index == c->finished_task_index)
-        return 0;
-
-    pthread_mutex_lock(&c->finished_task_mutex);
-    while (!c->finished_tasks[c->finished_task_index].outdata) {
-        pthread_cond_wait(&c->finished_task_cond, &c->finished_task_mutex);
+    if (c->submitted == c->returned) return 0;
+    index = c->finished_task_index;
+    FF_RETRO_WAIT(&c->ready[index], retro_atomic_load_acquire_int(&c->ready[index]));
+    task = c->finished_tasks[index];
+    result = task.return_code;
+    if (task.outdata) {
+        AVPacket *out = task.outdata;
+        *pkt = *out;
+        if (pkt->data) *got_packet_ptr = 1;
+        av_free(out);
     }
-    task = c->finished_tasks[c->finished_task_index];
-    *pkt = *(AVPacket*)(task.outdata);
-    if(pkt->data)
-        *got_packet_ptr = 1;
-    av_freep(&c->finished_tasks[c->finished_task_index].outdata);
-    c->finished_task_index = (c->finished_task_index+1) % BUFFER_SIZE;
-    pthread_mutex_unlock(&c->finished_task_mutex);
-
-    return task.return_code;
+    c->finished_tasks[index].outdata = NULL;
+    retro_atomic_store_release_int(&c->ready[index], 0);
+    ++c->returned;
+    c->finished_task_index = (index + 1) % BUFFER_SIZE;
+    return result;
 }

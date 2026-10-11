@@ -23,6 +23,7 @@
 
 #include "buffer.h"
 #include "thread.h"
+#include <retro_atomic.h>
 
 /**
  * The buffer is always treated as read-only.
@@ -40,7 +41,7 @@ struct AVBuffer {
     /**
      *  number of existing AVBufferRef instances referring to this buffer
      */
-    volatile int refcount;
+    retro_atomic_int_t refcount;
 
     /**
      * a callback for freeing the data
@@ -73,8 +74,7 @@ typedef struct BufferPoolEntry {
 } BufferPoolEntry;
 
 struct AVBufferPool {
-    AVMutex mutex;
-    BufferPoolEntry *pool;
+    retro_atomic_ptr_t pool;
 
     /*
      * This is used to track when the pool is to be freed.
@@ -85,9 +85,8 @@ struct AVBufferPool {
      * buffers have been released, then it's safe to free the pool and all
      * the buffers in it.
      */
-    volatile int refcount;
+    retro_atomic_int_t refcount;
 
-    volatile int nb_allocated;
 
     int size;
     AVBufferRef* (*alloc)(int size);

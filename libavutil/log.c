@@ -39,11 +39,8 @@
 #include "common.h"
 #include "internal.h"
 #include "log.h"
+#include "retro_thread.h"
 
-#if HAVE_PTHREADS
-#include <pthread.h>
-static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-#endif
 
 #define LINE_SZ 1024
 
@@ -53,8 +50,10 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 #define BACKTRACE_LOGLEVEL AV_LOG_ERROR
 #endif
 
-static int av_log_level = AV_LOG_INFO;
-static int flags;
+static retro_atomic_int_t log_level = RETRO_ATOMIC_INT_INITIALIZER(AV_LOG_INFO);
+#define av_log_level retro_atomic_load_acquire_int(&log_level)
+static retro_atomic_int_t log_flags = RETRO_ATOMIC_INT_INITIALIZER(0);
+#define flags retro_atomic_load_acquire_int(&log_flags)
 
 #define NB_LEVELS 8
 #if defined(_WIN32) && !defined(__MINGW32CE__) && HAVE_SETCONSOLETEXTATTRIBUTE
@@ -290,70 +289,23 @@ void av_log_format_line(void *ptr, int level, const char *fmt, va_list vl,
     av_bprint_finalize(part+3, NULL);
 }
 
-void av_log_default_callback(void* ptr, int level, const char* fmt, va_list vl)
+void av_log_default_callback(void *ptr, int level, const char *fmt, va_list vl)
 {
-    static int print_prefix = 1;
-    static int count;
-    static char prev[LINE_SZ];
-    AVBPrint part[4];
     char line[LINE_SZ];
-    static int is_atty;
-    int type[2];
-    unsigned tint = 0;
-
-    if (level >= 0) {
-        tint = level & 0xff00;
-        level &= 0xff;
-    }
-
-    if (level > av_log_level)
-        return;
-#if HAVE_PTHREADS
-    pthread_mutex_lock(&mutex);
-#endif
-
-    format_line(ptr, level, fmt, vl, part, &print_prefix, type);
-    snprintf(line, sizeof(line), "%s%s%s%s", part[0].str, part[1].str, part[2].str, part[3].str);
-
-#if HAVE_ISATTY
-    if (!is_atty)
-        is_atty = isatty(2) ? 1 : -1;
-#endif
-
-    if (print_prefix && (flags & AV_LOG_SKIP_REPEATED) && !strcmp(line, prev) &&
-        *line && line[strlen(line) - 1] != '\r'){
-        count++;
-        if (is_atty == 1)
-            fprintf(stderr, "    Last message repeated %d times\r", count);
-        goto end;
-    }
-    if (count > 0) {
-        fprintf(stderr, "    Last message repeated %d times\n", count);
-        count = 0;
-    }
-    strcpy(prev, line);
-    sanitize(part[0].str);
-    colored_fputs(type[0], 0, part[0].str);
-    sanitize(part[1].str);
-    colored_fputs(type[1], 0, part[1].str);
-    sanitize(part[2].str);
-    colored_fputs(av_clip(level >> 3, 0, NB_LEVELS - 1), tint >> 8, part[2].str);
-    sanitize(part[3].str);
-    colored_fputs(av_clip(level >> 3, 0, NB_LEVELS - 1), tint >> 8, part[3].str);
-
-#if CONFIG_VALGRIND_BACKTRACE
-    if (level <= BACKTRACE_LOGLEVEL)
-        VALGRIND_PRINTF_BACKTRACE("%s", "");
-#endif
-end:
-    av_bprint_finalize(part+3, NULL);
-#if HAVE_PTHREADS
-    pthread_mutex_unlock(&mutex);
-#endif
+    int prefix = 1;
+    if ((level & 0xff) > av_log_get_level()) return;
+    av_log_format_line(ptr, level & 0xff, fmt, vl, line, sizeof(line), &prefix);
+    fputs(line, stderr);
 }
 
-static void (*av_log_callback)(void*, int, const char*, va_list) =
-    av_log_default_callback;
+typedef void (*LogCallback)(void *, int, const char *, va_list);
+static retro_atomic_ptr_t log_callback_ptr;
+
+static AVOnce log_callback_once = AV_ONCE_INIT;
+static void init_log_callback(void)
+{
+    retro_atomic_store_release_ptr(&log_callback_ptr, (void *)av_log_default_callback);
+}
 
 void av_log(void* avcl, int level, const char *fmt, ...)
 {
@@ -369,7 +321,8 @@ void av_log(void* avcl, int level, const char *fmt, ...)
 
 void av_vlog(void* avcl, int level, const char *fmt, va_list vl)
 {
-    void (*log_callback)(void*, int, const char*, va_list) = av_log_callback;
+    ff_thread_once(&log_callback_once, init_log_callback);
+    LogCallback log_callback = (LogCallback)retro_atomic_load_acquire_ptr(&log_callback_ptr);
     if (log_callback)
         log_callback(avcl, level, fmt, vl);
 }
@@ -381,12 +334,12 @@ int av_log_get_level(void)
 
 void av_log_set_level(int level)
 {
-    av_log_level = level;
+    retro_atomic_store_release_int(&log_level, level);
 }
 
 void av_log_set_flags(int arg)
 {
-    flags = arg;
+    retro_atomic_store_release_int(&log_flags, arg);
 }
 
 int av_log_get_flags(void)
@@ -396,7 +349,8 @@ int av_log_get_flags(void)
 
 void av_log_set_callback(void (*callback)(void*, int, const char*, va_list))
 {
-    av_log_callback = callback;
+    ff_thread_once(&log_callback_once, init_log_callback);
+    retro_atomic_store_release_ptr(&log_callback_ptr, (void *)callback);
 }
 
 static void missing_feature_sample(int sample, void *avc, const char *msg,

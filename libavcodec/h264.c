@@ -664,7 +664,7 @@ av_cold int ff_h264_decode_init(AVCodecContext *avctx)
 
     ret = ff_thread_once(&h264_vlc_init, ff_h264_decode_init_vlc);
     if (ret != 0) {
-        av_log(avctx, AV_LOG_ERROR, "pthread_once has failed.");
+        av_log(avctx, AV_LOG_ERROR, "Codec table initialization has failed.");
         return AVERROR_UNKNOWN;
     }
 

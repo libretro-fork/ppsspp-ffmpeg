@@ -18,205 +18,152 @@
  * 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#include "fifo.h"
 #include "threadmessage.h"
-#include "thread.h"
+#include "retro_thread.h"
+#include "mem.h"
+#include "error.h"
+#include <limits.h>
+#include <string.h>
 
+/* Bounded MPMC sequence ring. A reserved slot has one writer or reader;
+ * release publication transfers its payload. Waits register before checking
+ * the slot again, so empty/full transitions cannot lose a notification. */
 struct AVThreadMessageQueue {
-#if HAVE_THREADS
-    AVFifoBuffer *fifo;
-    pthread_mutex_t lock;
-    pthread_cond_t cond_recv;
-    pthread_cond_t cond_send;
-    int err_send;
-    int err_recv;
-    unsigned elsize;
-    void (*free_func)(void *msg);
-#else
-    int dummy;
-#endif
+    uint8_t *data;
+    retro_atomic_int_t *sequence;
+    retro_atomic_int_t enqueue;
+    retro_atomic_int_t dequeue;
+    retro_atomic_int_t reserved;
+    retro_atomic_int_t err_send;
+    retro_atomic_int_t err_recv;
+    unsigned capacity, limit, elsize;
+    retro_atomic_ptr_t free_func;
 };
 
-int av_thread_message_queue_alloc(AVThreadMessageQueue **mq,
-                                  unsigned nelem,
-                                  unsigned elsize)
+int av_thread_message_queue_alloc(AVThreadMessageQueue **mq, unsigned nelem, unsigned elsize)
 {
-#if HAVE_THREADS
-    AVThreadMessageQueue *rmq;
-    int ret = 0;
-
-    if (nelem > INT_MAX / elsize)
-        return AVERROR(EINVAL);
-    if (!(rmq = av_mallocz(sizeof(*rmq))))
+    AVThreadMessageQueue *q;
+    unsigned capacity = 2, i;
+    if (!nelem || !elsize || nelem > INT_MAX / 2) return AVERROR(EINVAL);
+    while (capacity < nelem) capacity *= 2;
+    if (capacity > INT_MAX / elsize) return AVERROR(EINVAL);
+    q = av_mallocz(sizeof(*q));
+    if (!q) return AVERROR(ENOMEM);
+    q->data = av_malloc_array(capacity, elsize);
+    q->sequence = av_malloc_array(capacity, sizeof(*q->sequence));
+    if (!q->data || !q->sequence) {
+        av_free(q->data); av_free(q->sequence); av_free(q);
         return AVERROR(ENOMEM);
-    if ((ret = pthread_mutex_init(&rmq->lock, NULL))) {
-        av_free(rmq);
-        return AVERROR(ret);
     }
-    if ((ret = pthread_cond_init(&rmq->cond_recv, NULL))) {
-        pthread_mutex_destroy(&rmq->lock);
-        av_free(rmq);
-        return AVERROR(ret);
-    }
-    if ((ret = pthread_cond_init(&rmq->cond_send, NULL))) {
-        pthread_cond_destroy(&rmq->cond_recv);
-        pthread_mutex_destroy(&rmq->lock);
-        av_free(rmq);
-        return AVERROR(ret);
-    }
-    if (!(rmq->fifo = av_fifo_alloc(elsize * nelem))) {
-        pthread_cond_destroy(&rmq->cond_send);
-        pthread_cond_destroy(&rmq->cond_recv);
-        pthread_mutex_destroy(&rmq->lock);
-        av_free(rmq);
-        return AVERROR(ret);
-    }
-    rmq->elsize = elsize;
-    *mq = rmq;
+    retro_atomic_ptr_init(&q->free_func, NULL);
+    q->capacity = capacity; q->limit = nelem; q->elsize = elsize;
+    retro_atomic_int_init(&q->enqueue, 0);
+    retro_atomic_int_init(&q->dequeue, 0);
+    retro_atomic_int_init(&q->reserved, 0);
+    retro_atomic_int_init(&q->err_send, 0);
+    retro_atomic_int_init(&q->err_recv, 0);
+    retro_atomic_ptr_init(&q->free_func, NULL);
+    for (i = 0; i < capacity; ++i) retro_atomic_int_init(&q->sequence[i], i);
+    *mq = q;
     return 0;
-#else
-    *mq = NULL;
-    return AVERROR(ENOSYS);
-#endif /* HAVE_THREADS */
 }
-
-void av_thread_message_queue_set_free_func(AVThreadMessageQueue *mq,
-                                           void (*free_func)(void *msg))
+void av_thread_message_queue_set_free_func(AVThreadMessageQueue *q, void (*fn)(void *))
 {
-#if HAVE_THREADS
-    mq->free_func = free_func;
-#endif
+    retro_atomic_store_release_ptr(&q->free_func, (void *)fn);
 }
 
+static int try_recv(AVThreadMessageQueue *q, void *msg, int bounded, unsigned stop)
+{
+    unsigned pos = (unsigned)retro_atomic_load_relaxed_int(&q->dequeue), slot;
+    for (;;) {
+        int difference;
+        if (bounded && (int)(pos - stop) >= 0) return 0;
+        slot = pos & (q->capacity - 1);
+        difference = (int)((unsigned)retro_atomic_load_acquire_int(&q->sequence[slot]) - (pos + 1));
+        if (difference < 0) return 0;
+        if (!difference && retro_atomic_cas_int(&q->dequeue, (int)pos, (int)(pos + 1))) break;
+        pos = (unsigned)retro_atomic_load_relaxed_int(&q->dequeue);
+    }
+    if (msg) memcpy(msg, q->data + slot * q->elsize, q->elsize);
+    else {
+        void (*free_func)(void *) = (void (*)(void *))retro_atomic_load_acquire_ptr(&q->free_func);
+        if (free_func) free_func(q->data + slot * q->elsize);
+    }
+    retro_atomic_store_release_int(&q->sequence[slot], (int)(pos + q->capacity));
+    retro_atomic_fetch_sub_int(&q->reserved, 1);
+    FF_RETRO_NOTIFY(q);
+    return 1;
+}
+
+int av_thread_message_queue_send(AVThreadMessageQueue *q, void *msg, unsigned flags)
+{
+    unsigned pos, slot;
+    for (;;) {
+        int error = retro_atomic_load_acquire_int(&q->err_send);
+        int count = retro_atomic_load_acquire_int(&q->reserved);
+        if (error) return error;
+        if ((unsigned)count < q->limit && retro_atomic_cas_int(&q->reserved, count, count + 1)) break;
+        if (flags & AV_THREAD_MESSAGE_NONBLOCK) return AVERROR(EAGAIN);
+        FF_RETRO_WAIT(q, (unsigned)retro_atomic_load_acquire_int(&q->reserved) < q->limit ||
+                         retro_atomic_load_acquire_int(&q->err_send));
+    }
+    for (;;) {
+        pos = (unsigned)retro_atomic_load_acquire_int(&q->enqueue);
+        slot = pos & (q->capacity - 1);
+        if ((unsigned)retro_atomic_load_acquire_int(&q->sequence[slot]) == pos &&
+            retro_atomic_cas_int(&q->enqueue, (int)pos, (int)(pos + 1))) break;
+        if ((flags & AV_THREAD_MESSAGE_NONBLOCK) || retro_atomic_load_acquire_int(&q->err_send)) {
+            int error = retro_atomic_load_acquire_int(&q->err_send);
+            retro_atomic_fetch_sub_int(&q->reserved, 1);
+            FF_RETRO_NOTIFY(q);
+            return error ? error : AVERROR(EAGAIN);
+        }
+        FF_RETRO_WAIT(q, (unsigned)retro_atomic_load_acquire_int(&q->sequence[slot]) == pos ||
+                         (unsigned)retro_atomic_load_acquire_int(&q->enqueue) != pos || retro_atomic_load_acquire_int(&q->err_send));
+    }
+    memcpy(q->data + slot * q->elsize, msg, q->elsize);
+    retro_atomic_store_release_int(&q->sequence[slot], (int)(pos + 1));
+    FF_RETRO_NOTIFY(q);
+    return 0;
+}
+int av_thread_message_queue_recv(AVThreadMessageQueue *q, void *msg, unsigned flags)
+{
+    for (;;) {
+        int error;
+        unsigned pos, slot;
+        if (try_recv(q, msg, 0, 0)) return 0;
+        error = retro_atomic_load_acquire_int(&q->err_recv);
+        if (error) return error;
+        if (flags & AV_THREAD_MESSAGE_NONBLOCK) return AVERROR(EAGAIN);
+        pos = (unsigned)retro_atomic_load_acquire_int(&q->dequeue);
+        slot = pos & (q->capacity - 1);
+        FF_RETRO_WAIT(q, (int)((unsigned)retro_atomic_load_acquire_int(&q->sequence[slot]) - (pos + 1)) >= 0 ||
+                         retro_atomic_load_acquire_int(&q->err_recv));
+    }
+}
+void av_thread_message_queue_set_err_send(AVThreadMessageQueue *q, int err)
+{
+    retro_atomic_store_release_int(&q->err_send, err);
+    FF_RETRO_NOTIFY(q);
+}
+void av_thread_message_queue_set_err_recv(AVThreadMessageQueue *q, int err)
+{
+    retro_atomic_store_release_int(&q->err_recv, err);
+    FF_RETRO_NOTIFY(q);
+}
+void av_thread_message_flush(AVThreadMessageQueue *q)
+{
+    /* Bound the drain to the messages claimed before the snapshot. Process
+     * each payload in its owned slot, so flush/free cannot fail to allocate. */
+    unsigned stop = (unsigned)retro_atomic_load_acquire_int(&q->enqueue);
+    while (try_recv(q, NULL, 1, stop)) {}
+
+}
 void av_thread_message_queue_free(AVThreadMessageQueue **mq)
 {
-#if HAVE_THREADS
-    if (*mq) {
-        av_thread_message_flush(*mq);
-        av_fifo_freep(&(*mq)->fifo);
-        pthread_cond_destroy(&(*mq)->cond_send);
-        pthread_cond_destroy(&(*mq)->cond_recv);
-        pthread_mutex_destroy(&(*mq)->lock);
-        av_freep(mq);
-    }
-#endif
-}
-
-#if HAVE_THREADS
-
-static int av_thread_message_queue_send_locked(AVThreadMessageQueue *mq,
-                                               void *msg,
-                                               unsigned flags)
-{
-    while (!mq->err_send && av_fifo_space(mq->fifo) < mq->elsize) {
-        if ((flags & AV_THREAD_MESSAGE_NONBLOCK))
-            return AVERROR(EAGAIN);
-        pthread_cond_wait(&mq->cond_send, &mq->lock);
-    }
-    if (mq->err_send)
-        return mq->err_send;
-    av_fifo_generic_write(mq->fifo, msg, mq->elsize, NULL);
-    /* one message is sent, signal one receiver */
-    pthread_cond_signal(&mq->cond_recv);
-    return 0;
-}
-
-static int av_thread_message_queue_recv_locked(AVThreadMessageQueue *mq,
-                                               void *msg,
-                                               unsigned flags)
-{
-    while (!mq->err_recv && av_fifo_size(mq->fifo) < mq->elsize) {
-        if ((flags & AV_THREAD_MESSAGE_NONBLOCK))
-            return AVERROR(EAGAIN);
-        pthread_cond_wait(&mq->cond_recv, &mq->lock);
-    }
-    if (av_fifo_size(mq->fifo) < mq->elsize)
-        return mq->err_recv;
-    av_fifo_generic_read(mq->fifo, msg, mq->elsize, NULL);
-    /* one message space appeared, signal one sender */
-    pthread_cond_signal(&mq->cond_send);
-    return 0;
-}
-
-#endif /* HAVE_THREADS */
-
-int av_thread_message_queue_send(AVThreadMessageQueue *mq,
-                                 void *msg,
-                                 unsigned flags)
-{
-#if HAVE_THREADS
-    int ret;
-
-    pthread_mutex_lock(&mq->lock);
-    ret = av_thread_message_queue_send_locked(mq, msg, flags);
-    pthread_mutex_unlock(&mq->lock);
-    return ret;
-#else
-    return AVERROR(ENOSYS);
-#endif /* HAVE_THREADS */
-}
-
-int av_thread_message_queue_recv(AVThreadMessageQueue *mq,
-                                 void *msg,
-                                 unsigned flags)
-{
-#if HAVE_THREADS
-    int ret;
-
-    pthread_mutex_lock(&mq->lock);
-    ret = av_thread_message_queue_recv_locked(mq, msg, flags);
-    pthread_mutex_unlock(&mq->lock);
-    return ret;
-#else
-    return AVERROR(ENOSYS);
-#endif /* HAVE_THREADS */
-}
-
-void av_thread_message_queue_set_err_send(AVThreadMessageQueue *mq,
-                                          int err)
-{
-#if HAVE_THREADS
-    pthread_mutex_lock(&mq->lock);
-    mq->err_send = err;
-    pthread_cond_broadcast(&mq->cond_send);
-    pthread_mutex_unlock(&mq->lock);
-#endif /* HAVE_THREADS */
-}
-
-void av_thread_message_queue_set_err_recv(AVThreadMessageQueue *mq,
-                                          int err)
-{
-#if HAVE_THREADS
-    pthread_mutex_lock(&mq->lock);
-    mq->err_recv = err;
-    pthread_cond_broadcast(&mq->cond_recv);
-    pthread_mutex_unlock(&mq->lock);
-#endif /* HAVE_THREADS */
-}
-
-#if HAVE_THREADS
-static void free_func_wrap(void *arg, void *msg, int size)
-{
-    AVThreadMessageQueue *mq = arg;
-    mq->free_func(msg);
-}
-#endif
-
-void av_thread_message_flush(AVThreadMessageQueue *mq)
-{
-#if HAVE_THREADS
-    int used, off;
-    void *free_func = mq->free_func;
-
-    pthread_mutex_lock(&mq->lock);
-    used = av_fifo_size(mq->fifo);
-    if (free_func)
-        for (off = 0; off < used; off += mq->elsize)
-            av_fifo_generic_peek_at(mq->fifo, mq, off, mq->elsize, free_func_wrap);
-    av_fifo_drain(mq->fifo, used);
-    /* only the senders need to be notified since the queue is empty and there
-     * is nothing to read */
-    pthread_cond_broadcast(&mq->cond_send);
-    pthread_mutex_unlock(&mq->lock);
-#endif /* HAVE_THREADS */
+    AVThreadMessageQueue *q;
+    if (!mq || !*mq) return;
+    q = *mq; *mq = NULL;
+    av_thread_message_flush(q);
+    av_free(q->data); av_free(q->sequence); av_free(q);
 }
